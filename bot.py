@@ -23,23 +23,44 @@ intents.reactions = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 LINK_FILE = "linked_channels.json"
+HISTORY_FILE = "history.json"
+
+linked_channels = {}
+last_translated = {}
+
 FLAG_LANG_MAP = {
     "🇫🇷": "FR", "🇪🇸": "ES", "🇯🇵": "JA", "🇩🇪": "DE", "🇨🇳": "ZH",
     "🇷🇺": "RU", "🇮🇹": "IT", "🇰🇷": "KO", "🇺🇸": "EN-US", "🇬🇧": "EN-GB",
     "🇬🇷": "EL", "🇸🇦": "AR",
 }
 
+# ===== Load / Save =====
 def load_links():
+    global linked_channels
     if os.path.exists(LINK_FILE):
         with open(LINK_FILE, "r") as f:
-            return json.load(f)
-    return {}
+            linked_channels = json.load(f)
+    else:
+        linked_channels = {}
 
-def save_links(data):
+def save_links():
     with open(LINK_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+        json.dump(linked_channels, f, indent=4)
 
-linked_channels = load_links()
+def load_history():
+    global last_translated
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r") as f:
+            last_translated = json.load(f)
+    else:
+        last_translated = {}
+
+def save_history():
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(last_translated, f, indent=4)
+
+load_links()
+load_history()
 
 # ===== WEBHOOK SENDER =====
 async def send_webhook(channel, user, text, reply_to=None, auto_delete=False, target_lang=None):
@@ -49,7 +70,6 @@ async def send_webhook(channel, user, text, reply_to=None, auto_delete=False, ta
         webhook = await channel.create_webhook(name="TranslatorBot")
 
     if reply_to:
-        # Translate the replied-to message if target_lang is provided
         reply_text = reply_to.content
         if target_lang:
             try:
@@ -80,7 +100,7 @@ async def on_ready():
 async def link(interaction: discord.Interaction, channel: discord.TextChannel, lang: str):
     await interaction.response.defer(ephemeral=True)
     linked_channels[str(channel.id)] = lang.upper()
-    save_links(linked_channels)
+    save_links()
     await interaction.followup.send(f"✅ Linked {channel.mention} to `{lang.upper()}`", ephemeral=True)
 
 @bot.tree.command(name="unlink", description="Unlink a channel from translations")
@@ -89,7 +109,7 @@ async def unlink(interaction: discord.Interaction, channel: discord.TextChannel)
     await interaction.response.defer(ephemeral=True)
     if str(channel.id) in linked_channels:
         del linked_channels[str(channel.id)]
-        save_links(linked_channels)
+        save_links()
         await interaction.followup.send(f"❌ Unlinked {channel.mention}", ephemeral=True)
     else:
         await interaction.followup.send("⚠️ That channel isn't linked.", ephemeral=True)
@@ -109,31 +129,43 @@ async def translate_history(interaction: discord.Interaction, channel: discord.T
     await interaction.response.defer(ephemeral=True)
 
     if not linked_channels:
-        await interaction.followup.send("⚠️ There are no linked channels to send translations to.", ephemeral=True)
+        await interaction.followup.send("⚠️ No linked channels.", ephemeral=True)
         return
 
+    last_id = last_translated.get(str(channel.id), 0)
     count = 0
+
     async for msg in channel.history(limit=limit, oldest_first=True):
         if msg.author.bot or msg.webhook_id:
             continue
+        if msg.id <= last_id:
+            continue
+
         for target_id, target_lang in linked_channels.items():
             if int(target_id) == channel.id:
-                continue  # skip the source channel
+                continue
             target_channel = bot.get_channel(int(target_id))
             if not target_channel:
                 continue
             reply_msg = msg.reference.resolved if msg.reference else None
             try:
-                translated = translator.translate_text(msg.content, target_lang=target_lang)
-                await send_webhook(target_channel, msg.author, translated.text, reply_to=reply_msg, target_lang=target_lang)
+                translated_text = translator.translate_text(msg.content, target_lang=target_lang).text
+                chunk_size = 1900
+                for i in range(0, len(translated_text), chunk_size):
+                    await send_webhook(target_channel, msg.author, translated_text[i:i+chunk_size],
+                                       reply_to=reply_msg, target_lang=target_lang)
             except Exception as e:
                 print(f"History translation failed: {e}")
                 if ADMIN_USER_ID:
                     admin = await bot.fetch_user(ADMIN_USER_ID)
                     await admin.send(f"⚠️ History translation failed in {target_channel.mention}: {e}")
+
+        last_id = msg.id
         count += 1
 
-    await interaction.followup.send(f"✅ Translated last {count} messages from {channel.mention}", ephemeral=True)
+    last_translated[str(channel.id)] = last_id
+    save_history()
+    await interaction.followup.send(f"✅ Translated {count} messages from {channel.mention}", ephemeral=True)
 
 # ===== AUTO TRANSLATION =====
 @bot.event
@@ -156,8 +188,8 @@ async def on_message(message):
 
         reply_msg = message.reference.resolved if message.reference else None
         try:
-            translated = translator.translate_text(message.content, target_lang=target_lang)
-            await send_webhook(target_channel, message.author, translated.text, reply_to=reply_msg, target_lang=target_lang)
+            translated_text = translator.translate_text(message.content, target_lang=target_lang).text
+            await send_webhook(target_channel, message.author, translated_text, reply_to=reply_msg, target_lang=target_lang)
         except Exception as e:
             print(f"Translation failed: {e}")
             if ADMIN_USER_ID:
@@ -183,12 +215,13 @@ async def on_raw_reaction_add(payload):
 
     reply_msg = message.reference.resolved if message.reference else None
     try:
-        translated = translator.translate_text(message.content, target_lang=lang)
-        await send_webhook(channel, message.author, translated.text, reply_to=reply_msg, auto_delete=True, target_lang=lang)
+        translated_text = translator.translate_text(message.content, target_lang=lang).text
+        await send_webhook(channel, message.author, translated_text, reply_to=reply_msg, auto_delete=True, target_lang=lang)
     except Exception as e:
         print(f"Flag translation failed: {e}")
         if ADMIN_USER_ID:
             admin = await bot.fetch_user(ADMIN_USER_ID)
             await admin.send(f"⚠️ Flag translation failed in {channel.mention}: {e}")
 
+# ===== RUN BOT =====
 bot.run(BOT_TOKEN)
